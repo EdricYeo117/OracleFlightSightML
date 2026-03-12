@@ -5,6 +5,7 @@ import cv2
 import numpy as np
 import torch
 
+from calibration_utils import build_feature_vector
 from l2cs import Pipeline, FaceMeshDetector, HeadPoseEstimator
 
 
@@ -45,6 +46,7 @@ def draw_head_pose(frame, pose_result):
         2,
     )
 
+
 def extract_first_gaze(result):
     if result is None:
         return None, None
@@ -66,30 +68,32 @@ def extract_first_gaze(result):
     return None, None
 
 
-def draw_gaze_text(frame, result):
-    yaw, pitch = extract_first_gaze(result)
+def draw_gaze_text(frame, yaw, pitch):
+    if yaw is None or pitch is None:
+        return
 
-    if yaw is not None:
-        cv2.putText(
-            frame,
-            f"Gaze Yaw: {yaw:.2f}",
-            (20, 130),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 255, 0),
-            2,
-        )
+    yaw_deg = np.degrees(yaw)
+    pitch_deg = np.degrees(pitch)
 
-    if pitch is not None:
-        cv2.putText(
-            frame,
-            f"Gaze Pitch: {pitch:.2f}",
-            (20, 160),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 255, 0),
-            2,
-        )
+    cv2.putText(
+        frame,
+        f"Gaze Yaw: {yaw_deg:.2f} deg",
+        (20, 130),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (0, 255, 0),
+        2,
+    )
+
+    cv2.putText(
+        frame,
+        f"Gaze Pitch: {pitch_deg:.2f} deg",
+        (20, 160),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (0, 255, 0),
+        2,
+    )
 
 
 def extract_eye_center(points_2d):
@@ -98,12 +102,38 @@ def extract_eye_center(points_2d):
     return ((left_eye + right_eye) / 2.0).astype(int)
 
 
-def draw_gaze_arrow(frame, origin, yaw, pitch, length=140, color=(255, 0, 0), thickness=2):
+def draw_gaze_arrow(frame, origin, yaw, pitch, length=140, color=(0, 0, 255), thickness=2):
     dx = int(-length * np.sin(yaw))
     dy = int(-length * np.sin(pitch))
 
     end_point = (int(origin[0] + dx), int(origin[1] + dy))
     cv2.line(frame, (int(origin[0]), int(origin[1])), end_point, color, thickness)
+
+
+def draw_feature_text(frame, features):
+    if features is None:
+        return
+
+    y0 = 210
+    dy = 24
+
+    lines = [
+        f"face_cx: {features['face_cx']:.1f}",
+        f"face_cy: {features['face_cy']:.1f}",
+        f"face_w: {features['face_w']:.1f}",
+        f"face_h: {features['face_h']:.1f}",
+    ]
+
+    for i, text in enumerate(lines):
+        cv2.putText(
+            frame,
+            text,
+            (20, y0 + i * dy),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 255, 255),
+            2,
+        )
 
 
 def main():
@@ -139,6 +169,7 @@ def main():
         return
 
     start_time = time.time()
+    frame_idx = 0
 
     try:
         while True:
@@ -147,12 +178,10 @@ def main():
                 print("Failed to read frame from webcam.")
                 break
 
-            # Do not mirror if you want true left/right behavior
-            # frame = cv2.flip(frame, 1)
+            frame_idx += 1
+            timestamp_ms = int((time.time() - start_time) * 1000)
 
             gaze_result = gaze_pipeline.step(frame)
-
-            timestamp_ms = int((time.time() - start_time) * 1000)
             mesh_result = face_mesh.process(frame, timestamp_ms)
 
             pose_result = None
@@ -161,7 +190,16 @@ def main():
                 draw_landmarks(frame, mesh_result["points_2d"], radius=1)
 
             yaw, pitch = extract_first_gaze(gaze_result)
-            if mesh_result is not None and yaw is not None and pitch is not None:
+            features = None
+
+            if mesh_result is not None and pose_result is not None and yaw is not None and pitch is not None:
+                features = build_feature_vector(
+                    gaze_yaw=yaw,
+                    gaze_pitch=pitch,
+                    pose_result=pose_result,
+                    points_2d=mesh_result["points_2d"],
+                )
+
                 eye_center = extract_eye_center(mesh_result["points_2d"])
                 draw_gaze_arrow(
                     frame,
@@ -169,12 +207,16 @@ def main():
                     yaw=yaw,
                     pitch=pitch,
                     length=140,
-                    color=(255, 0, 0),
+                    color=(0, 0, 255),
                     thickness=2,
                 )
 
+                if frame_idx % 30 == 0:
+                    print(features)
+
             draw_head_pose(frame, pose_result)
-            draw_gaze_text(frame, gaze_result)
+            draw_gaze_text(frame, yaw, pitch)
+            draw_feature_text(frame, features)
 
             cv2.imshow("L2CS + FaceLandmarker + HeadPose", frame)
 
