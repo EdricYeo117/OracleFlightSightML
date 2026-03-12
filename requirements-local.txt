@@ -1,0 +1,8 @@
+opencv-python
+numpy
+Pillow
+tqdm
+filterpy
+face_detection_tflite
+torch
+torchvision
