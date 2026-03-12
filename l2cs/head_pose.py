@@ -1,11 +1,7 @@
 import cv2
 import numpy as np
-from math import atan2, sqrt, pi
 
 
-# MediaPipe Face Mesh landmark indices commonly used for head pose
-# nose tip, chin, left eye outer corner, right eye outer corner,
-# left mouth corner, right mouth corner
 POSE_LANDMARKS = {
     "nose_tip": 1,
     "chin": 152,
@@ -16,17 +12,20 @@ POSE_LANDMARKS = {
 }
 
 
+def _wrap_angle_deg(angle):
+    return ((angle + 180.0) % 360.0) - 180.0
+
+
 class HeadPoseEstimator:
     def __init__(self):
-        # Generic 3D face model points
         self.model_points = np.array(
             [
-                (0.0, 0.0, 0.0),          # nose tip
-                (0.0, -63.6, -12.5),      # chin
-                (-43.3, 32.7, -26.0),     # left eye outer
-                (43.3, 32.7, -26.0),      # right eye outer
-                (-28.9, -28.9, -24.1),    # left mouth
-                (28.9, -28.9, -24.1),     # right mouth
+                (0.0, 0.0, 0.0),
+                (0.0, -63.6, -12.5),
+                (-43.3, 32.7, -26.0),
+                (43.3, 32.7, -26.0),
+                (-28.9, -28.9, -24.1),
+                (28.9, -28.9, -24.1),
             ],
             dtype=np.float64,
         )
@@ -46,11 +45,11 @@ class HeadPoseEstimator:
 
     def estimate(self, frame_bgr, points_2d):
         h, w = frame_bgr.shape[:2]
-
         image_points = self._get_image_points(points_2d)
 
-        focal_length = w
-        center = (w / 2, h / 2)
+        focal_length = float(w)
+        center = (w / 2.0, h / 2.0)
+
         camera_matrix = np.array(
             [
                 [focal_length, 0, center[0]],
@@ -74,12 +73,45 @@ class HeadPoseEstimator:
             return None
 
         rotation_matrix, _ = cv2.Rodrigues(rvec)
-        pose_matrix = cv2.hconcat((rotation_matrix, tvec))
-        _, _, _, _, _, _, euler_angles = cv2.decomposeProjectionMatrix(pose_matrix)
 
-        pitch = float(euler_angles[0, 0])
-        yaw = float(euler_angles[1, 0])
-        roll = float(euler_angles[2, 0])
+        sy = np.sqrt(rotation_matrix[0, 0] ** 2 + rotation_matrix[1, 0] ** 2)
+        singular = sy < 1e-6
+
+        if not singular:
+            pitch_rad = np.arctan2(rotation_matrix[2, 1], rotation_matrix[2, 2])
+            yaw_rad = np.arctan2(-rotation_matrix[2, 0], sy)
+            roll_rad = np.arctan2(rotation_matrix[1, 0], rotation_matrix[0, 0])
+        else:
+            pitch_rad = np.arctan2(-rotation_matrix[1, 2], rotation_matrix[1, 1])
+            yaw_rad = np.arctan2(-rotation_matrix[2, 0], sy)
+            roll_rad = 0.0
+
+        pitch = float(np.degrees(pitch_rad))
+        yaw = float(np.degrees(yaw_rad))
+        roll = float(np.degrees(roll_rad))
+
+        pitch = _wrap_angle_deg(pitch)
+        yaw = _wrap_angle_deg(yaw)
+        roll = _wrap_angle_deg(roll)
+
+        if pitch < -90.0:
+            pitch += 180.0
+        elif pitch > 90.0:
+            pitch -= 180.0
+
+        if yaw < -90.0:
+            yaw += 180.0
+        elif yaw > 90.0:
+            yaw -= 180.0
+
+        if roll < -90.0:
+            roll += 180.0
+        elif roll > 90.0:
+            roll -= 180.0
+
+        pitch = _wrap_angle_deg(pitch)
+        yaw = _wrap_angle_deg(yaw)
+        roll = _wrap_angle_deg(roll)
 
         nose_3d = np.array([(0.0, 0.0, 100.0)], dtype=np.float64)
         nose_end_2d, _ = cv2.projectPoints(
@@ -87,7 +119,8 @@ class HeadPoseEstimator:
         )
 
         nose_tip = tuple(image_points[0].astype(int))
-        nose_end = tuple(nose_end_2d.reshape(-1, 2)[0].astype(int))
+        projected_end = nose_end_2d.reshape(-1, 2)[0]
+        nose_end = tuple((2 * image_points[0] - projected_end).astype(int))
 
         return {
             "pitch": pitch,

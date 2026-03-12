@@ -1,5 +1,8 @@
 import time
+from pathlib import Path
+
 import cv2
+import numpy as np
 import torch
 
 from l2cs import Pipeline, FaceMeshDetector, HeadPoseEstimator
@@ -13,14 +16,6 @@ def draw_landmarks(frame, points_2d, color=(0, 255, 0), radius=1):
 def draw_head_pose(frame, pose_result):
     if pose_result is None:
         return
-
-    cv2.line(
-        frame,
-        pose_result["nose_tip"],
-        pose_result["nose_end"],
-        (255, 0, 0),
-        2,
-    )
 
     cv2.putText(
         frame,
@@ -49,7 +44,6 @@ def draw_head_pose(frame, pose_result):
         (0, 255, 255),
         2,
     )
-
 
 def extract_first_gaze(result):
     if result is None:
@@ -98,17 +92,41 @@ def draw_gaze_text(frame, result):
         )
 
 
+def extract_eye_center(points_2d):
+    left_eye = points_2d[33]
+    right_eye = points_2d[263]
+    return ((left_eye + right_eye) / 2.0).astype(int)
+
+
+def draw_gaze_arrow(frame, origin, yaw, pitch, length=140, color=(255, 0, 0), thickness=2):
+    dx = int(-length * np.sin(yaw))
+    dy = int(-length * np.sin(pitch))
+
+    end_point = (int(origin[0] + dx), int(origin[1] + dy))
+    cv2.line(frame, (int(origin[0]), int(origin[1])), end_point, color, thickness)
+
+
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    project_root = Path(__file__).resolve().parent
+    gaze_model_path = project_root / "models" / "L2CSNet_gaze360.pkl"
+    face_model_path = project_root / "models" / "face_landmarker.task"
+
+    if not gaze_model_path.exists():
+        raise FileNotFoundError(f"L2CS model not found: {gaze_model_path}")
+
+    if not face_model_path.exists():
+        raise FileNotFoundError(f"Face Landmarker model not found: {face_model_path}")
+
     gaze_pipeline = Pipeline(
-        weights="models/L2CSNet_gaze360.pkl",
+        weights=str(gaze_model_path),
         arch="ResNet50",
         device=device,
     )
 
     face_mesh = FaceMeshDetector(
-        model_path="models/face_landmarker.task",
+        model_path=str(face_model_path),
         num_faces=1,
         running_mode="VIDEO",
     )
@@ -116,41 +134,62 @@ def main():
     head_pose_estimator = HeadPoseEstimator()
 
     cap = cv2.VideoCapture(0)
-
     if not cap.isOpened():
         print("Error: could not open webcam")
         return
 
     start_time = time.time()
 
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                print("Failed to read frame from webcam.")
+                break
 
-        frame = cv2.flip(frame, 1)
+            # Do not mirror if you want true left/right behavior
+            # frame = cv2.flip(frame, 1)
 
-        gaze_result = gaze_pipeline.step(frame)
+            gaze_result = gaze_pipeline.step(frame)
 
-        timestamp_ms = int((time.time() - start_time) * 1000)
-        mesh_result = face_mesh.process(frame, timestamp_ms)
+            timestamp_ms = int((time.time() - start_time) * 1000)
+            mesh_result = face_mesh.process(frame, timestamp_ms)
 
-        pose_result = None
-        if mesh_result is not None:
-            pose_result = head_pose_estimator.estimate(frame, mesh_result["points_2d"])
-            draw_landmarks(frame, mesh_result["points_2d"], radius=1)
+            pose_result = None
+            if mesh_result is not None:
+                pose_result = head_pose_estimator.estimate(frame, mesh_result["points_2d"])
+                draw_landmarks(frame, mesh_result["points_2d"], radius=1)
 
-        draw_head_pose(frame, pose_result)
-        draw_gaze_text(frame, gaze_result)
+            yaw, pitch = extract_first_gaze(gaze_result)
+            if mesh_result is not None and yaw is not None and pitch is not None:
+                eye_center = extract_eye_center(mesh_result["points_2d"])
+                draw_gaze_arrow(
+                    frame,
+                    origin=eye_center,
+                    yaw=yaw,
+                    pitch=pitch,
+                    length=140,
+                    color=(255, 0, 0),
+                    thickness=2,
+                )
 
-        cv2.imshow("L2CS + FaceLandmarker + HeadPose", frame)
+            draw_head_pose(frame, pose_result)
+            draw_gaze_text(frame, gaze_result)
 
-        key = cv2.waitKey(1) & 0xFF
-        if key == 27 or key == ord("q"):
-            break
+            cv2.imshow("L2CS + FaceLandmarker + HeadPose", frame)
 
-    cap.release()
-    cv2.destroyAllWindows()
+            key = cv2.waitKey(1) & 0xFF
+            if key == 27 or key == ord("q"):
+                print("Exiting on user request.")
+                break
+
+    except KeyboardInterrupt:
+        print("\nKeyboard interrupt received. Exiting cleanly...")
+
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        print("Webcam released and windows closed.")
 
 
 if __name__ == "__main__":
