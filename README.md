@@ -1,148 +1,204 @@
+# OracleFlightSightML
 
+A practical, webcam-based gaze-to-screen pipeline built on top of **L2CS-Net**.
 
+This repository combines:
+- **Gaze estimation** (yaw/pitch) using a pretrained L2CS model,
+- **Face mesh + head pose features**, and
+- A lightweight **screen-point mapper** trained from a short per-user calibration session.
 
- <p align="center">
-  <img src="https://github.com/Ahmednull/Storage/blob/main/gaze.gif" alt="animated" />
-</p>
+The result is a local real-time prototype that predicts where on your screen a user is looking.
 
+---
 
-___
+## What this project does
 
-# L2CS-Net
+The project has two layers:
 
-The official PyTorch implementation of L2CS-Net for gaze estimation and tracking.
+1. **Base gaze estimation (L2CS)**
+   - Uses `l2cs.Pipeline` with pretrained weights (`models/L2CSNet_gaze360.pkl`) to infer gaze angles.
+2. **Personal calibration mapper**
+   - Collects calibration samples while the user looks at known points.
+   - Builds a feature vector from gaze + head pose + face geometry.
+   - Trains two ridge-regression models (`model_x.pkl`, `model_y.pkl`) to map features -> screen coordinates.
 
-## Installation
-<img src="https://img.shields.io/badge/python%20-%2314354C.svg?&style=for-the-badge&logo=python&logoColor=white"/> <img src="https://img.shields.io/badge/PyTorch%20-%23EE4C2C.svg?&style=for-the-badge&logo=PyTorch&logoColor=white" />
+---
 
-Install package with the following:
+## Repository structure
 
+- `collect_calibration.py` – interactive fullscreen calibration collection.
+- `train_mapper.py` – trains `model_x.pkl` and `model_y.pkl` from calibration CSV.
+- `predict_screen_point.py` – realtime prediction loop with webcam preview + predicted dot.
+- `calibration_utils.py` – feature definitions and helper utilities.
+- `demo.py` – standard L2CS webcam gaze demo (without screen mapping).
+- `l2cs/` – package implementation (pipeline, face mesh wrappers, model code, rendering helpers).
+- `models/` – model assets (gaze model + face landmark task).
+- `requirements.txt` / `pyproject.toml` – dependency and packaging metadata.
+
+---
+
+## Requirements
+
+### Hardware
+- Webcam.
+- GPU optional (CPU works, lower throughput).
+
+### Software
+- Python 3.8+ recommended.
+- OpenCV GUI support (for fullscreen calibration/prediction windows).
+
+---
+
+## Setup
+
+### 1) Clone and enter project
+
+```bash
+git clone <your-repo-url>
+cd OracleFlightSightML
 ```
-pip install git+https://github.com/edavalosanaya/L2CS-Net.git@main
+
+### 2) Create virtual environment (recommended)
+
+```bash
+python -m venv .venv
+source .venv/bin/activate  # Linux/macOS
+# .venv\Scripts\activate   # Windows PowerShell
 ```
 
-Or, you can git clone the repo and install with the following:
+### 3) Install dependencies
 
-```
-pip install [-e] .
-```
-
-Now you should be able to import the package with the following command:
-
-```
-$ python
->>> import l2cs
+```bash
+pip install -U pip
+pip install -r requirements.txt
+pip install -e .
 ```
 
-## Usage
+> `pip install -e .` makes the local `l2cs` package importable in editable mode.
 
-Detect face and predict gaze from webcam
+---
 
-```python
-from l2cs import Pipeline, render
-import cv2
+## Quick start (end-to-end)
 
-gaze_pipeline = Pipeline(
-    weights=CWD / 'models' / 'L2CSNet_gaze360.pkl',
-    arch='ResNet50',
-    device=torch.device('cpu') # or 'gpu'
-)
- 
-cap = cv2.VideoCapture(cam)
-_, frame = cap.read()    
+### Step A: Collect calibration data
 
-# Process frame and visualize
-results = gaze_pipeline.step(frame)
-frame = render(frame, results)
+```bash
+python collect_calibration.py
 ```
 
-## Demo
-* Download the pre-trained models from [here](https://drive.google.com/drive/folders/17p6ORr-JQJcw-eYtG2WGNiuS_qVKwdWd?usp=sharing) and Store it to *models/*.
-*  Run:
+What happens:
+- Opens a fullscreen window and runs multiple target phases:
+  - 9-point grid pass 1
+  - 9-point grid pass 2
+  - center refinement
+  - random refinement
+- For each target, it waits briefly, aggregates samples, and writes rows to `calibration_samples.csv`.
+
+Controls:
+- `SPACE` to start.
+- `Q` or `ESC` to quit.
+
+### Step B: Train screen mapper
+
+```bash
+python train_mapper.py
 ```
- python demo.py \
- --snapshot models/L2CSNet_gaze360.pkl \
- --gpu 0 \
- --cam 0 \
+
+Outputs:
+- `model_x.pkl`
+- `model_y.pkl`
+
+Notes:
+- Requires `calibration_samples.csv` to exist.
+- Expects at least 15 rows (27+ recommended for stability).
+
+### Step C: Run realtime screen-point prediction
+
+```bash
+python predict_screen_point.py
 ```
-This means the demo will run using *L2CSNet_gaze360.pkl* pretrained model
 
-## Community Contributions
+What you will see:
+- Fullscreen gray canvas.
+- Webcam preview inset with face landmarks.
+- Predicted gaze point rendered as a red dot with white ring.
 
-- [Gaze Detection and Eye Tracking: A How-To Guide](https://blog.roboflow.com/gaze-direction-position/): Use L2CS-Net through a HTTP interface with the open source Roboflow Inference project.
+Exit with `Q` or `ESC`.
 
-## MPIIGaze
-We provide the code for train and test MPIIGaze dataset with leave-one-person-out evaluation.
+---
 
-### Prepare datasets
-* Download **MPIIFaceGaze dataset** from [here](https://www.mpi-inf.mpg.de/departments/computer-vision-and-machine-learning/research/gaze-based-human-computer-interaction/its-written-all-over-your-face-full-face-appearance-based-gaze-estimation).
-* Apply data preprocessing from [here](http://phi-ai.buaa.edu.cn/Gazehub/3D-dataset/).
-* Store the dataset to *datasets/MPIIFaceGaze*.
+## Feature engineering used for mapping
 
-### Train
+The mapper is trained on these per-frame features:
+
+- `gaze_yaw`
+- `gaze_pitch`
+- `head_yaw`
+- `head_pitch`
+- `head_roll`
+- `face_cx`
+- `face_cy`
+- `face_w`
+- `face_h`
+
+Targets:
+- `target_x` (screen x coordinate in pixels)
+- `target_y` (screen y coordinate in pixels)
+
+Modeling approach:
+- Two independent pipelines (x and y):
+  - `StandardScaler`
+  - `Ridge(alpha=5.0)`
+
+---
+
+## Running the base L2CS webcam demo
+
+If you only want gaze vectors (without screen coordinate mapping):
+
+```bash
+python demo.py --device cpu --cam 0 --arch ResNet50
 ```
- python train.py \
- --dataset mpiigaze \
- --snapshot output/snapshots \
- --gpu 0 \
- --num_epochs 50 \
- --batch_size 16 \
- --lr 0.00001 \
- --alpha 1 \
 
+---
+
+## Troubleshooting
+
+### Webcam cannot be opened
+- Ensure no other app is using the camera.
+- Try another camera index (`0`, `1`, ...).
+- Check OS camera permissions.
+
+### Fullscreen size fallback
+If screen dimensions cannot be queried, scripts fallback to `1920x1080`.
+
+### Missing model assets
+Ensure these files exist:
+- `models/L2CSNet_gaze360.pkl`
+- `models/face_landmarker.task`
+
+### Poor prediction quality
+- Re-run calibration with stable lighting and seated posture.
+- Keep head naturally mobile during calibration to capture realistic variation.
+- Increase number/diversity of calibration points.
+
+---
+
+## Development tips
+
+- Validate imports quickly:
+
+```bash
+python -c "import l2cs; print('ok')"
 ```
-This means the code will perform leave-one-person-out training automatically and store the models to *output/snapshots*.
 
-### Test
-```
- python test.py \
- --dataset mpiigaze \
- --snapshot output/snapshots/snapshot_folder \
- --evalpath evaluation/L2CS-mpiigaze  \
- --gpu 0 \
-```
-This means the code will perform leave-one-person-out testing automatically and store the results to *evaluation/L2CS-mpiigaze*.
+- Keep generated artifacts out of commits when experimenting:
+  - `calibration_samples.csv`
+  - `model_x.pkl`
+  - `model_y.pkl`
 
-To get the average leave-one-person-out accuracy use:
-```
- python leave_one_out_eval.py \
- --evalpath evaluation/L2CS-mpiigaze  \
- --respath evaluation/L2CS-mpiigaze  \
-```
-This means the code will take the evaluation path and outputs the leave-one-out gaze accuracy to the *evaluation/L2CS-mpiigaze*.
+---
 
-## Gaze360
-We provide the code for train and test Gaze360 dataset with train-val-test evaluation.
+## License
 
-### Prepare datasets
-* Download **Gaze360 dataset** from [here](http://gaze360.csail.mit.edu/download.php).
-
-* Apply data preprocessing from [here](http://phi-ai.buaa.edu.cn/Gazehub/3D-dataset/).
-
-* Store the dataset to *datasets/Gaze360*.
-
-
-### Train
-```
- python train.py \
- --dataset gaze360 \
- --snapshot output/snapshots \
- --gpu 0 \
- --num_epochs 50 \
- --batch_size 16 \
- --lr 0.00001 \
- --alpha 1 \
-
-```
-This means the code will perform training and store the models to *output/snapshots*.
-
-### Test
-```
- python test.py \
- --dataset gaze360 \
- --snapshot output/snapshots/snapshot_folder \
- --evalpath evaluation/L2CS-gaze360  \
- --gpu 0 \
-```
-This means the code will perform testing on snapshot_folder and store the results to *evaluation/L2CS-gaze360*.
-
+This repository includes a `LICENSE` file. Check it for usage terms.
