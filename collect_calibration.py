@@ -1,9 +1,11 @@
 import csv
+import random
 import time
 from pathlib import Path
 
 import cv2
 import numpy as np
+import pandas as pd
 import torch
 
 from l2cs import Pipeline, FaceMeshDetector, HeadPoseEstimator
@@ -64,7 +66,72 @@ def draw_text(frame, lines, start=(30, 40), dy=35, color=(255, 255, 255)):
         )
 
 
+def generate_center_refinement_targets(screen_w, screen_h):
+    return [
+        (int(screen_w * 0.50), int(screen_h * 0.50)),  # center
+        (int(screen_w * 0.35), int(screen_h * 0.50)),  # center-left
+        (int(screen_w * 0.65), int(screen_h * 0.50)),  # center-right
+        (int(screen_w * 0.50), int(screen_h * 0.35)),  # upper-center
+        (int(screen_w * 0.50), int(screen_h * 0.65)),  # lower-center
+    ]
+
+
+def generate_random_targets(screen_w, screen_h, count=10, margin=0.12):
+    x_min = int(screen_w * margin)
+    x_max = int(screen_w * (1.0 - margin))
+    y_min = int(screen_h * margin)
+    y_max = int(screen_h * (1.0 - margin))
+
+    targets = []
+    for _ in range(count):
+        x = random.randint(x_min, x_max)
+        y = random.randint(y_min, y_max)
+        targets.append((x, y))
+    return targets
+
+
+def build_calibration_schedule(screen_w, screen_h, random_count=10):
+    base_9 = generate_9_point_targets(screen_w, screen_h, margin=0.12)
+    repeated_9 = generate_9_point_targets(screen_w, screen_h, margin=0.12)
+    center_refine = generate_center_refinement_targets(screen_w, screen_h)
+    random_targets = generate_random_targets(screen_w, screen_h, count=random_count, margin=0.12)
+
+    schedule = []
+
+    for i, target in enumerate(base_9):
+        schedule.append({
+            "phase": "grid_pass_1",
+            "point_index": i,
+            "target": target,
+        })
+
+    for i, target in enumerate(repeated_9):
+        schedule.append({
+            "phase": "grid_pass_2",
+            "point_index": i,
+            "target": target,
+        })
+
+    for i, target in enumerate(center_refine):
+        schedule.append({
+            "phase": "center_refine",
+            "point_index": i,
+            "target": target,
+        })
+
+    for i, target in enumerate(random_targets):
+        schedule.append({
+            "phase": "random_refine",
+            "point_index": i,
+            "target": target,
+        })
+
+    return schedule
+
+
 def main():
+    random.seed(42)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     project_root = Path(__file__).resolve().parent
@@ -97,36 +164,32 @@ def main():
         cap.release()
         return
 
-    # Create a fullscreen window first
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
-    # Show a temporary frame so OpenCV creates the fullscreen surface
     temp = np.zeros((720, 1280, 3), dtype=np.uint8)
     cv2.imshow(WINDOW_NAME, temp)
     cv2.waitKey(100)
 
-    # Get actual fullscreen window size
     _, _, screen_w, screen_h = cv2.getWindowImageRect(WINDOW_NAME)
-
     if screen_w <= 0 or screen_h <= 0:
-        screen_h, screen_w = 1080, 1920
+        screen_w, screen_h = 1920, 1080
 
-    targets = generate_9_point_targets(screen_w, screen_h, margin=0.12)
+    schedule = build_calibration_schedule(screen_w, screen_h, random_count=10)
 
     rows = []
-    point_index = 0
+    current_index = 0
     start_time = time.time()
 
-    settle_seconds = 1.0
-    collect_seconds = 1.2
+    settle_seconds = 0.9
+    collect_seconds = 1.3
 
     state = "wait_start"
     state_start = time.time()
     samples_for_point = []
 
     print("Calibration started.")
-    print("Look at each red dot.")
+    print("Phases: 9-point grid, repeated 9-point grid, center refinement, random refinement.")
     print("Press SPACE to begin, Q or ESC to quit.")
 
     try:
@@ -149,16 +212,13 @@ def main():
 
             yaw, pitch = extract_first_gaze(gaze_result)
 
-            # Fullscreen canvas
             canvas = np.zeros((screen_h, screen_w, 3), dtype=np.uint8)
             canvas[:] = (40, 40, 40)
 
-            # Put webcam preview as inset
             preview_h, preview_w = preview.shape[:2]
             inset_w = min(480, screen_w // 3)
             inset_h = int(preview_h * (inset_w / preview_w))
             preview_small = cv2.resize(preview, (inset_w, inset_h))
-
             canvas[20:20 + inset_h, 20:20 + inset_w] = preview_small
 
             now = time.time()
@@ -167,15 +227,19 @@ def main():
                 draw_text(
                     canvas,
                     [
-                        "9-Point Calibration",
+                        "Multi-Stage Calibration",
                         "Press SPACE to start",
-                        "Look directly at each red dot when collecting",
+                        "Look directly at each red dot",
+                        "Phases: grid -> repeat grid -> center refine -> random refine",
                     ],
                     start=(30, 40),
                 )
 
-            elif point_index < len(targets):
-                target = targets[point_index]
+            elif current_index < len(schedule):
+                item = schedule[current_index]
+                target = item["target"]
+                phase = item["phase"]
+
                 draw_dot(canvas, target)
 
                 if state == "settle":
@@ -183,7 +247,8 @@ def main():
                     draw_text(
                         canvas,
                         [
-                            f"Point {point_index + 1} / {len(targets)}",
+                            f"Step {current_index + 1} / {len(schedule)}",
+                            f"Phase: {phase}",
                             "Focus on the red dot",
                             f"Settling... {remaining:.1f}s",
                         ],
@@ -200,7 +265,8 @@ def main():
                     draw_text(
                         canvas,
                         [
-                            f"Point {point_index + 1} / {len(targets)}",
+                            f"Step {current_index + 1} / {len(schedule)}",
+                            f"Phase: {phase}",
                             "Keep looking at the red dot",
                             f"Collecting... {remaining:.1f}s",
                         ],
@@ -223,14 +289,16 @@ def main():
                                 **avg_features,
                                 "target_x": float(target[0]),
                                 "target_y": float(target[1]),
-                                "point_index": point_index,
+                                "phase": phase,
+                                "point_index": item["point_index"],
+                                "schedule_index": current_index,
                             }
                             rows.append(row)
-                            print(f"Saved point {point_index + 1}: {target}")
+                            print(f"Saved {phase} point at {target}")
                         else:
-                            print(f"No valid samples for point {point_index + 1}")
+                            print(f"No valid samples for step {current_index + 1}")
 
-                        point_index += 1
+                        current_index += 1
                         state = "settle"
                         state_start = now
 
@@ -256,14 +324,19 @@ def main():
                 state = "settle"
                 state_start = time.time()
 
-            if point_index >= len(targets) and key == ord("s"):
+            if current_index >= len(schedule) and key == ord("s"):
                 if rows:
-                    fieldnames = FEATURE_COLUMNS + ["target_x", "target_y", "point_index"]
-                    with open(out_csv_path, "w", newline="", encoding="utf-8") as f:
-                        writer = csv.DictWriter(f, fieldnames=fieldnames)
-                        writer.writeheader()
-                        writer.writerows(rows)
+                    new_df = pd.DataFrame(rows)
+
+                    if out_csv_path.exists():
+                        old_df = pd.read_csv(out_csv_path)
+                        combined_df = pd.concat([old_df, new_df], ignore_index=True)
+                    else:
+                        combined_df = new_df
+
+                    combined_df.to_csv(out_csv_path, index=False)
                     print(f"Saved calibration CSV to: {out_csv_path}")
+                    print(f"Total rows now: {len(combined_df)}")
                 else:
                     print("No rows to save.")
                 break
