@@ -1,3 +1,4 @@
+import time
 import cv2
 import torch
 
@@ -50,17 +51,34 @@ def draw_head_pose(frame, pose_result):
     )
 
 
-def draw_gaze_text(frame, result):
+def extract_first_gaze(result):
     if result is None:
-        return
+        return None, None
 
-    yaw = getattr(result, "yaw", None)
-    pitch = getattr(result, "pitch", None)
+    if hasattr(result, "yaw") and hasattr(result, "pitch"):
+        yaw = result.yaw
+        pitch = result.pitch
+
+        if hasattr(yaw, "__len__") and len(yaw) > 0:
+            yaw = yaw[0]
+        if hasattr(pitch, "__len__") and len(pitch) > 0:
+            pitch = pitch[0]
+
+        try:
+            return float(yaw), float(pitch)
+        except Exception:
+            return None, None
+
+    return None, None
+
+
+def draw_gaze_text(frame, result):
+    yaw, pitch = extract_first_gaze(result)
 
     if yaw is not None:
         cv2.putText(
             frame,
-            f"Gaze Yaw: {float(yaw):.2f}",
+            f"Gaze Yaw: {yaw:.2f}",
             (20, 130),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.7,
@@ -71,7 +89,7 @@ def draw_gaze_text(frame, result):
     if pitch is not None:
         cv2.putText(
             frame,
-            f"Gaze Pitch: {float(pitch):.2f}",
+            f"Gaze Pitch: {pitch:.2f}",
             (20, 160),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.7,
@@ -89,7 +107,12 @@ def main():
         device=device,
     )
 
-    face_mesh = FaceMeshDetector()
+    face_mesh = FaceMeshDetector(
+        model_path="models/face_landmarker.task",
+        num_faces=1,
+        running_mode="VIDEO",
+    )
+
     head_pose_estimator = HeadPoseEstimator()
 
     cap = cv2.VideoCapture(0)
@@ -98,6 +121,8 @@ def main():
         print("Error: could not open webcam")
         return
 
+    start_time = time.time()
+
     while True:
         ok, frame = cap.read()
         if not ok:
@@ -105,13 +130,11 @@ def main():
 
         frame = cv2.flip(frame, 1)
 
-        # 1. L2CS gaze
         gaze_result = gaze_pipeline.step(frame)
 
-        # 2. MediaPipe landmarks
-        mesh_result = face_mesh.process(frame)
+        timestamp_ms = int((time.time() - start_time) * 1000)
+        mesh_result = face_mesh.process(frame, timestamp_ms)
 
-        # 3. Head pose from landmarks
         pose_result = None
         if mesh_result is not None:
             pose_result = head_pose_estimator.estimate(frame, mesh_result["points_2d"])
@@ -120,7 +143,7 @@ def main():
         draw_head_pose(frame, pose_result)
         draw_gaze_text(frame, gaze_result)
 
-        cv2.imshow("L2CS + FaceMesh + HeadPose", frame)
+        cv2.imshow("L2CS + FaceLandmarker + HeadPose", frame)
 
         key = cv2.waitKey(1) & 0xFF
         if key == 27 or key == ord("q"):
