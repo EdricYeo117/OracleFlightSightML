@@ -5,6 +5,7 @@ from .pipeline import Pipeline
 from .face_mesh_localmodel import FaceMeshDetector
 from .head_pose import HeadPoseEstimator
 from .datasets import Gaze360, Mpiigaze
+from .eye_gaze_estimator import EyeGazeEstimator
 
 __all__ = [
     "L2CS",
@@ -20,6 +21,7 @@ __all__ = [
     "gazeto3d",
     "angular",
     "getArch",
+    "EyeGazeEstimator",
 ]
 
 # from .utils import select_device, natural_keys, gazeto3d, angular, getArch
