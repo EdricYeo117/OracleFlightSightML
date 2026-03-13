@@ -1,5 +1,7 @@
 import time
+from collections import deque
 from pathlib import Path
+
 
 import cv2
 import numpy as np
@@ -8,13 +10,139 @@ import torch
 from l2cs import Pipeline, FaceMeshDetector, EyeGazeEstimator, HeadPoseEstimator
 
 
-PANEL_WIDTH = 430
-WINDOW_NAME = "Iris + L2CS Direction Debug"
+PANEL_WIDTH = 460
+WINDOW_NAME = "Temporal Iris + L2CS Gaze Debug"
 
 LEFT_EYE_IDX = [33, 133, 159, 145]
 RIGHT_EYE_IDX = [263, 362, 386, 374]
 LEFT_IRIS_IDX = [468, 469, 470, 471]
 RIGHT_IRIS_IDX = [473, 474, 475, 476]
+
+
+class TemporalGazeTracker:
+    def __init__(
+        self,
+        iris_alpha: float = 0.55,
+        l2cs_alpha: float = 0.75,
+        head_alpha: float = 0.70,
+        final_alpha: float = 0.60,
+        history_size: int = 10,
+    ):
+        self.iris_alpha = iris_alpha
+        self.l2cs_alpha = l2cs_alpha
+        self.head_alpha = head_alpha
+        self.final_alpha = final_alpha
+
+        self.iris_vec = None
+        self.l2cs_vec = None
+        self.head_pose = None
+        self.final_vec = None
+
+        self.history = deque(maxlen=history_size)
+        self.frame_idx = 0
+        self.start_time = time.time()
+
+    def reset(self):
+        self.iris_vec = None
+        self.l2cs_vec = None
+        self.head_pose = None
+        self.final_vec = None
+        self.history.clear()
+        self.frame_idx = 0
+        self.start_time = time.time()
+
+    @staticmethod
+    def _ema_vec(prev, cur, alpha):
+        if cur is None:
+            return prev
+        if prev is None:
+            return cur
+        return (
+            alpha * prev[0] + (1.0 - alpha) * cur[0],
+            alpha * prev[1] + (1.0 - alpha) * cur[1],
+        )
+
+    @staticmethod
+    def _ema_head(prev, cur, alpha):
+        if cur is None:
+            return prev
+        if prev is None:
+            return {
+                "yaw": float(cur["yaw"]),
+                "pitch": float(cur["pitch"]),
+                "roll": float(cur["roll"]),
+            }
+        return {
+            "yaw": alpha * prev["yaw"] + (1.0 - alpha) * cur["yaw"],
+            "pitch": alpha * prev["pitch"] + (1.0 - alpha) * cur["pitch"],
+            "roll": alpha * prev["roll"] + (1.0 - alpha) * cur["roll"],
+        }
+
+    @staticmethod
+    def _mag(vec):
+        if vec is None:
+            return 0.0
+        return float(np.hypot(vec[0], vec[1]))
+
+    def update(self, iris_vec, l2cs_vec, head_pose, blink_like=False):
+        self.frame_idx += 1
+
+        self.iris_vec = self._ema_vec(self.iris_vec, iris_vec, self.iris_alpha)
+        self.l2cs_vec = self._ema_vec(self.l2cs_vec, l2cs_vec, self.l2cs_alpha)
+        self.head_pose = self._ema_head(self.head_pose, head_pose, self.head_alpha)
+
+        fused = None
+        iris_weight = None
+        l2cs_weight = None
+
+        if self.iris_vec is not None and self.l2cs_vec is not None:
+            iris_strength = min(1.0, self._mag(self.iris_vec))
+
+            head_strength = 0.0
+            if self.head_pose is not None:
+                head_strength = min(
+                    1.0,
+                    max(abs(self.head_pose["yaw"]) / 20.0, abs(self.head_pose["pitch"]) / 20.0),
+                )
+
+            iris_weight = 0.72 + 0.18 * iris_strength + 0.06 * head_strength
+            iris_weight = float(np.clip(iris_weight, 0.70, 0.95))
+            l2cs_weight = 1.0 - iris_weight
+
+            if blink_like:
+                iris_weight = 0.55
+                l2cs_weight = 0.45
+
+            fused = (
+                iris_weight * self.iris_vec[0] + l2cs_weight * self.l2cs_vec[0],
+                iris_weight * self.iris_vec[1] + l2cs_weight * self.l2cs_vec[1],
+            )
+
+        elif self.iris_vec is not None:
+            fused = self.iris_vec
+            iris_weight = 1.0
+            l2cs_weight = 0.0
+
+        elif self.l2cs_vec is not None:
+            fused = self.l2cs_vec
+            iris_weight = 0.0
+            l2cs_weight = 1.0
+
+        self.final_vec = self._ema_vec(self.final_vec, fused, self.final_alpha)
+
+        snapshot = {
+            "frame": self.frame_idx,
+            "t": time.time() - self.start_time,
+            "iris_vec": self.iris_vec,
+            "l2cs_vec": self.l2cs_vec,
+            "head_pose": self.head_pose,
+            "final_vec": self.final_vec,
+            "iris_weight": iris_weight,
+            "l2cs_weight": l2cs_weight,
+            "blink_like": bool(blink_like),
+        }
+        self.history.append(snapshot)
+        return snapshot
 
 
 def extract_first_gaze(result):
@@ -124,17 +252,12 @@ def l2cs_to_vector(yaw, pitch):
     if yaw is None or pitch is None:
         return None
 
-    # Use screen-style direction:
-    # left  = negative x
-    # right = positive x
-    # up    = negative y
-    # down  = positive y
     dx = -np.sin(yaw)
     dy = -np.sin(pitch)
     return float(dx), float(dy)
 
 
-def iris_to_vector(eye_dx, eye_dy, gain_x=6.0, gain_y=5.0, invert_x=True, invert_y=False):
+def iris_to_vector(eye_dx, eye_dy, gain_x=5.0, gain_y=4.0, invert_x=True, invert_y=False):
     dx = eye_dx * gain_x
     dy = eye_dy * gain_y
 
@@ -165,77 +288,16 @@ def vector_to_dir(dx, dy, thresh=0.12):
     return f"{v}-{h}"
 
 
-# Kept for later use if you want fusion again.
-# def head_pose_strength(pose_result):
-#     if pose_result is None:
-#         return 0.0
-#
-#     yaw = abs(float(pose_result.get("yaw", 0.0)))
-#     pitch = abs(float(pose_result.get("pitch", 0.0)))
-#
-#     yaw_strength = min(1.0, yaw / 20.0)
-#     pitch_strength = min(1.0, pitch / 20.0)
-#     return float(max(yaw_strength, pitch_strength))
+def fmt_vec(name, vec):
+    if vec is None:
+        return f"{name}=None"
+    return f"{name}=({vec[0]:+.3f},{vec[1]:+.3f})"
 
 
-# Kept for later use if you want fusion again.
-# def fuse_vectors_dynamic(iris_vec, l2cs_vec, eye_result=None, pose_result=None):
-#     if iris_vec is None and l2cs_vec is None:
-#         return None
-#     if iris_vec is None:
-#         return {
-#             "dx": float(l2cs_vec[0]),
-#             "dy": float(l2cs_vec[1]),
-#             "iris_weight": 0.0,
-#             "l2cs_weight": 1.0,
-#         }
-#     if l2cs_vec is None:
-#         return {
-#             "dx": float(iris_vec[0]),
-#             "dy": float(iris_vec[1]),
-#             "iris_weight": 1.0,
-#             "l2cs_weight": 0.0,
-#         }
-#
-#     iris_strength = float(np.hypot(iris_vec[0], iris_vec[1]))
-#     iris_strength = min(1.0, iris_strength)
-#
-#     head_strength = head_pose_strength(pose_result)
-#
-#     iris_weight = 0.70 + 0.20 * iris_strength + 0.08 * head_strength
-#     iris_weight = float(np.clip(iris_weight, 0.70, 0.95))
-#     l2cs_weight = 1.0 - iris_weight
-#
-#     if eye_result is not None and eye_result.get("blink_like", False):
-#         iris_weight = 0.55
-#         l2cs_weight = 0.45
-#
-#     dx = iris_weight * iris_vec[0] + l2cs_weight * l2cs_vec[0]
-#     dy = iris_weight * iris_vec[1] + l2cs_weight * l2cs_vec[1]
-#
-#     return {
-#         "dx": float(np.clip(dx, -1.0, 1.0)),
-#         "dy": float(np.clip(dy, -1.0, 1.0)),
-#         "iris_weight": float(iris_weight),
-#         "l2cs_weight": float(l2cs_weight),
-#     }
-
-
-# Kept for later use if you want region logic again.
-# def classify_6_region_from_vector(dx, dy, x_thresh=0.12, y_thresh=0.0):
-#     if dx <= -x_thresh:
-#         col = "left"
-#     elif dx >= x_thresh:
-#         col = "right"
-#     else:
-#         col = "middle"
-#
-#     if dy < y_thresh:
-#         row = "top"
-#     else:
-#         row = "bottom"
-#
-#     return f"{row} {col}"
+def fmt_head(head):
+    if head is None:
+        return "head=None"
+    return f"head=(yaw={head['yaw']:+.2f},pitch={head['pitch']:+.2f},roll={head['roll']:+.2f})"
 
 
 def build_side_panel(
@@ -246,6 +308,8 @@ def build_side_panel(
     pose_result,
     iris_vec,
     l2cs_vec,
+    final_vec,
+    tracker_snapshot,
     fps,
     calibration_state,
     mirror_mode,
@@ -255,9 +319,9 @@ def build_side_panel(
     panel = np.zeros((height, PANEL_WIDTH, 3), dtype=np.uint8)
 
     y = 35
-    dy = 28
+    dy = 26
 
-    def put(text, color=(255, 255, 255), scale=0.62, thickness=2):
+    def put(text, color=(255, 255, 255), scale=0.58, thickness=2):
         nonlocal y
         cv2.putText(
             panel,
@@ -270,73 +334,76 @@ def build_side_panel(
         )
         y += dy
 
-    put("Iris + L2CS Direction Debug", color=(0, 255, 255), scale=0.82)
-    put(f"FPS: {fps:.1f}", color=(220, 220, 220), scale=0.58)
+    put("Temporal Iris + L2CS Debug", color=(0, 255, 255), scale=0.80)
+    put(f"FPS: {fps:.1f}", color=(220, 220, 220), scale=0.54)
 
     if calibration_state["active"]:
-        put("Calibration: LOOK CENTER", color=(0, 255, 255), scale=0.72)
-        put(f"Collecting: {calibration_state['remaining']:.1f}s", color=(0, 255, 255), scale=0.65)
+        put("Calibration: LOOK CENTER", color=(0, 255, 255), scale=0.68)
+        put(f"Collecting: {calibration_state['remaining']:.1f}s", color=(0, 255, 255), scale=0.60)
     else:
-        put("Calibration: DONE", color=(0, 255, 0), scale=0.68)
+        put("Calibration: DONE", color=(0, 255, 0), scale=0.62)
 
-    put(f"Mirror mode: {mirror_mode}", color=(180, 180, 255), scale=0.58)
-    put(f"Iris invert X: {iris_invert_x}", color=(180, 180, 255), scale=0.58)
-    put(f"Iris invert Y: {iris_invert_y}", color=(180, 180, 255), scale=0.58)
+    put(f"Mirror mode: {mirror_mode}", color=(180, 180, 255), scale=0.54)
+    put(f"Iris invert X: {iris_invert_x}", color=(180, 180, 255), scale=0.54)
+    put(f"Iris invert Y: {iris_invert_y}", color=(180, 180, 255), scale=0.54)
 
     y += 6
 
     if eye_result is not None:
         put(f"Iris raw dir: {eye_result['direction']}", color=(0, 255, 0))
-        put(f"eye_dx_raw: {eye_result.get('eye_dx_raw', eye_result['eye_dx']):.3f}", color=(0, 255, 0), scale=0.58)
-        put(f"eye_dy_raw: {eye_result.get('eye_dy_raw', eye_result['eye_dy']):.3f}", color=(0, 255, 0), scale=0.58)
-        put(f"eye_dx: {eye_result['eye_dx']:.3f}", color=(0, 255, 0), scale=0.58)
-        put(f"eye_dy: {eye_result['eye_dy']:.3f}", color=(0, 255, 0), scale=0.58)
+        put(f"eye_dx_raw: {eye_result.get('eye_dx_raw', eye_result['eye_dx']):+.3f}", color=(0, 255, 0), scale=0.54)
+        put(f"eye_dy_raw: {eye_result.get('eye_dy_raw', eye_result['eye_dy']):+.3f}", color=(0, 255, 0), scale=0.54)
+        put(f"eye_dx: {eye_result['eye_dx']:+.3f}", color=(0, 255, 0), scale=0.54)
+        put(f"eye_dy: {eye_result['eye_dy']:+.3f}", color=(0, 255, 0), scale=0.54)
 
         baseline_eye_x = eye_result.get("baseline_eye_x", 0.5)
         baseline_eye_y = eye_result.get("baseline_eye_y", 0.5)
-        put(
-            f"baseline: ({baseline_eye_x:.3f}, {baseline_eye_y:.3f})",
-            color=(180, 255, 180),
-            scale=0.56,
-        )
-        put(
-            f"conf: {eye_result['confidence']:.2f} blink: {eye_result['blink_like']}",
-            color=(255, 255, 255),
-            scale=0.56,
-        )
+        put(f"baseline: ({baseline_eye_x:.3f}, {baseline_eye_y:.3f})", color=(180, 255, 180), scale=0.52)
+        put(f"conf: {eye_result['confidence']:.2f} blink: {eye_result['blink_like']}", color=(255, 255, 255), scale=0.52)
     else:
         put("Iris: none", color=(0, 0, 255))
 
     y += 6
 
     if yaw is not None and pitch is not None:
-        put(f"L2CS yaw: {np.degrees(yaw):.2f} deg", color=(255, 255, 0), scale=0.58)
-        put(f"L2CS pitch: {np.degrees(pitch):.2f} deg", color=(255, 255, 0), scale=0.58)
+        put(f"L2CS yaw: {np.degrees(yaw):+.2f} deg", color=(255, 255, 0), scale=0.54)
+        put(f"L2CS pitch: {np.degrees(pitch):+.2f} deg", color=(255, 255, 0), scale=0.54)
     else:
         put("L2CS: none", color=(0, 0, 255))
 
     if pose_result is not None:
-        put(f"Head yaw: {pose_result['yaw']:.2f}", color=(255, 200, 120), scale=0.58)
-        put(f"Head pitch: {pose_result['pitch']:.2f}", color=(255, 200, 120), scale=0.58)
-        put(f"Head roll: {pose_result['roll']:.2f}", color=(255, 200, 120), scale=0.58)
+        put(f"Head yaw: {pose_result['yaw']:+.2f}", color=(255, 200, 120), scale=0.54)
+        put(f"Head pitch: {pose_result['pitch']:+.2f}", color=(255, 200, 120), scale=0.54)
+        put(f"Head roll: {pose_result['roll']:+.2f}", color=(255, 200, 120), scale=0.54)
 
     y += 6
 
     if iris_vec is not None:
-        put(f"Iris vec: ({iris_vec[0]:.3f}, {iris_vec[1]:.3f})", color=(255, 0, 255), scale=0.56)
-        put(f"Iris dir: {vector_to_dir(iris_vec[0], iris_vec[1])}", color=(255, 0, 255), scale=0.56)
+        put(f"Iris vec: ({iris_vec[0]:+.3f}, {iris_vec[1]:+.3f})", color=(255, 0, 255), scale=0.52)
+        put(f"Iris dir: {vector_to_dir(iris_vec[0], iris_vec[1])}", color=(255, 0, 255), scale=0.52)
 
     if l2cs_vec is not None:
-        put(f"L2CS vec: ({l2cs_vec[0]:.3f}, {l2cs_vec[1]:.3f})", color=(0, 255, 255), scale=0.56)
-        put(f"L2CS dir: {vector_to_dir(l2cs_vec[0], l2cs_vec[1])}", color=(0, 255, 255), scale=0.56)
+        put(f"L2CS vec: ({l2cs_vec[0]:+.3f}, {l2cs_vec[1]:+.3f})", color=(0, 255, 255), scale=0.52)
+        put(f"L2CS dir: {vector_to_dir(l2cs_vec[0], l2cs_vec[1])}", color=(0, 255, 255), scale=0.52)
 
-    y += 10
-    put("Keys:", color=(255, 255, 0), scale=0.68)
-    put("Q / ESC : Quit", color=(220, 220, 220), scale=0.54)
-    put("R : Reset calibration", color=(220, 220, 220), scale=0.54)
-    put("M : Toggle mirror", color=(220, 220, 220), scale=0.54)
-    put("X : Toggle iris X invert", color=(220, 220, 220), scale=0.54)
-    put("Y : Toggle iris Y invert", color=(220, 220, 220), scale=0.54)
+    if final_vec is not None:
+        put(f"Final vec: ({final_vec[0]:+.3f}, {final_vec[1]:+.3f})", color=(255, 255, 255), scale=0.52)
+        put(f"Final dir: {vector_to_dir(final_vec[0], final_vec[1])}", color=(255, 255, 255), scale=0.52)
+
+    if tracker_snapshot is not None and tracker_snapshot["iris_weight"] is not None:
+        put(
+            f"Weights iris/l2cs: {tracker_snapshot['iris_weight']:.2f}/{tracker_snapshot['l2cs_weight']:.2f}",
+            color=(255, 255, 255),
+            scale=0.50,
+        )
+
+    y += 8
+    put("Keys:", color=(255, 255, 0), scale=0.64)
+    put("Q / ESC : Quit", color=(220, 220, 220), scale=0.50)
+    put("R : Reset calibration/tracker", color=(220, 220, 220), scale=0.50)
+    put("M : Toggle mirror", color=(220, 220, 220), scale=0.50)
+    put("X : Toggle iris X invert", color=(220, 220, 220), scale=0.50)
+    put("Y : Toggle iris Y invert", color=(220, 220, 220), scale=0.50)
 
     return panel
 
@@ -396,12 +463,19 @@ def main():
         baseline_alpha=0.15,
     )
 
+    tracker = TemporalGazeTracker(
+        iris_alpha=0.55,
+        l2cs_alpha=0.75,
+        head_alpha=0.70,
+        final_alpha=0.60,
+        history_size=10,
+    )
+
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         raise RuntimeError("Could not open webcam.")
 
     start_time = time.time()
-
     calibration_duration_s = 2.5
     calibration_samples_x = []
     calibration_samples_y = []
@@ -475,13 +549,22 @@ def main():
                     iris_vec = iris_to_vector(
                         eye_result["eye_dx"],
                         eye_result["eye_dy"],
-                        gain_x=6.0,
-                        gain_y=5.0,
+                        gain_x=5.0,
+                        gain_y=4.0,
                         invert_x=iris_invert_x,
                         invert_y=iris_invert_y,
                     )
 
                 l2cs_vec = l2cs_to_vector(yaw, pitch)
+
+                tracker_snapshot = tracker.update(
+                    iris_vec=iris_vec,
+                    l2cs_vec=l2cs_vec,
+                    head_pose=pose_result,
+                    blink_like=(eye_result["blink_like"] if eye_result is not None else False),
+                )
+
+                final_vec = tracker_snapshot["final_vec"]
 
                 if iris_vec is not None:
                     draw_arrow(
@@ -507,25 +590,30 @@ def main():
                         label="l2cs",
                     )
 
-                # Disabled for now so you can debug raw direction first.
-                # fused_info = fuse_vectors_dynamic(
-                #     iris_vec,
-                #     l2cs_vec,
-                #     eye_result=eye_result,
-                #     pose_result=pose_result,
-                # )
-                #
-                # if fused_info is not None:
-                #     draw_arrow(
-                #         frame,
-                #         eye_center,
-                #         fused_info["dx"],
-                #         fused_info["dy"],
-                #         length=150,
-                #         color=(255, 255, 255),
-                #         thickness=3,
-                #         label="fused",
-                #     )
+                if final_vec is not None:
+                    draw_arrow(
+                        frame,
+                        eye_center,
+                        final_vec[0],
+                        final_vec[1],
+                        length=145,
+                        color=(255, 255, 255),
+                        thickness=3,
+                        label="final",
+                    )
+
+                if tracker_snapshot["final_vec"] is not None and tracker_snapshot["frame"] % 5 == 0:
+                    final_dir = vector_to_dir(tracker_snapshot["final_vec"][0], tracker_snapshot["final_vec"][1])
+                    print(
+                        f"[{tracker_snapshot['frame']:05d}] "
+                        f"t={tracker_snapshot['t']:.2f}s "
+                        f"{fmt_vec('iris', tracker_snapshot['iris_vec'])} "
+                        f"{fmt_vec('l2cs', tracker_snapshot['l2cs_vec'])} "
+                        f"{fmt_vec('final', tracker_snapshot['final_vec'])} "
+                        f"{fmt_head(tracker_snapshot['head_pose'])} "
+                        f"blink={tracker_snapshot['blink_like']} "
+                        f"dir={final_dir}"
+                    )
 
                 fps = 1.0 / max(time.time() - loop_start, 1e-6)
                 panel = build_side_panel(
@@ -536,6 +624,8 @@ def main():
                     pose_result,
                     iris_vec,
                     l2cs_vec,
+                    final_vec,
+                    tracker_snapshot,
                     fps,
                     {
                         "active": calibration_active,
@@ -555,6 +645,7 @@ def main():
                 if key == ord("r"):
                     if hasattr(eye_estimator, "reset"):
                         eye_estimator.reset()
+                    tracker.reset()
                     start_time = time.time()
                     calibration_samples_x.clear()
                     calibration_samples_y.clear()
