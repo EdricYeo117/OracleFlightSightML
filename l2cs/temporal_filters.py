@@ -56,10 +56,10 @@ class TemporalHeadPoseFilter:
 class TemporalGazeTracker:
     def __init__(
         self,
-        iris_alpha=0.55,
-        l2cs_alpha=0.75,
-        head_alpha=0.70,
-        final_alpha=0.60,
+        iris_alpha=0.20,
+        l2cs_alpha=0.35,
+        head_alpha=0.50,
+        final_alpha=0.10,
     ):
         self.iris_filter = TemporalVectorFilter(alpha=iris_alpha)
         self.l2cs_filter = TemporalVectorFilter(alpha=l2cs_alpha)
@@ -81,7 +81,15 @@ class TemporalGazeTracker:
             return 0.0
         return float(np.hypot(vec[0], vec[1]))
 
-    def update(self, iris_vec, l2cs_vec, head_pose=None, blink_like=False):
+    def update(
+        self,
+        iris_vec,
+        l2cs_vec,
+        head_pose=None,
+        blink_like=False,
+        degrade_primary=False,
+        primary_confidence=1.0,
+    ):
         self.frame_idx += 1
 
         iris_vec_s = self.iris_filter.update(iris_vec)
@@ -94,30 +102,24 @@ class TemporalGazeTracker:
 
         if iris_vec_s is not None and l2cs_vec_s is not None:
             iris_strength = min(1.0, self._mag(iris_vec_s))
-            head_strength = 0.0
-            head_yaw_abs = 0.0
+            head_yaw_abs = abs(head_pose_s["yaw"]) if head_pose_s is not None else 0.0
 
-            if head_pose_s is not None:
-                head_yaw_abs = abs(head_pose_s["yaw"])
-                head_strength = min(
-                    1.0,
-                    max(abs(head_pose_s["yaw"]) / 20.0, abs(head_pose_s["pitch"]) / 20.0),
-                )
+            iris_weight = 0.72 + 0.10 * iris_strength
+            iris_weight = float(np.clip(iris_weight, 0.68, 0.82))
 
-            iris_weight = 0.65 + 0.15 * iris_strength
-            iris_weight = float(np.clip(iris_weight, 0.60, 0.82))
+            if degrade_primary:
+                if head_yaw_abs > 35.0:
+                    iris_weight = min(iris_weight, 0.68)
+                elif head_yaw_abs > 25.0:
+                    iris_weight = min(iris_weight, 0.72)
 
-            # If head pose is large, do not let LaserGaze dominate too much
-            if head_yaw_abs > 25.0:
-                iris_weight = min(iris_weight, 0.70)
-            if head_yaw_abs > 35.0:
-                iris_weight = min(iris_weight, 0.62)
-
-            l2cs_weight = 1.0 - iris_weight
+                if primary_confidence < 0.995:
+                    iris_weight = min(iris_weight, 0.70)
 
             if blink_like:
-                iris_weight = 0.50
-                l2cs_weight = 0.50
+                iris_weight = min(iris_weight, 0.35)
+
+            l2cs_weight = 1.0 - iris_weight
 
             final_raw = np.array(
                 [
@@ -148,4 +150,6 @@ class TemporalGazeTracker:
             "iris_weight": iris_weight,
             "l2cs_weight": l2cs_weight,
             "blink_like": bool(blink_like),
+            "degrade_primary": bool(degrade_primary),
+            "primary_confidence": float(primary_confidence),
         }

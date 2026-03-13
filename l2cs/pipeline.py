@@ -17,28 +17,29 @@ class Pipeline:
         self,
         weights: pathlib.Path,
         arch: str,
-        device: str = "cpu",
+        device: Union[str, torch.device] = "cpu",
         include_detector: bool = True,
         confidence_threshold: float = 0.5,
     ):
-        self.weights = weights
+        self.weights = pathlib.Path(weights)
         self.include_detector = include_detector
-        self.device = device
-        self.confidence_threshold = confidence_threshold
+        self.device = torch.device(device) if not isinstance(device, torch.device) else device
+        self.confidence_threshold = float(confidence_threshold)
 
         self.model = getArch(arch, 90)
-        self.model.load_state_dict(torch.load(self.weights, map_location=device))
+        self.model.load_state_dict(torch.load(self.weights, map_location=self.device))
         self.model.to(self.device)
         self.model.eval()
 
+        self.softmax = nn.Softmax(dim=1)
+        self.idx_tensor = torch.arange(90, dtype=torch.float32, device=self.device)
+
         if self.include_detector:
-            if device.type == "cpu":
+            if self.device.type == "cpu":
                 self.detector = RetinaFace()
             else:
-                self.detector = RetinaFace(gpu_id=device.index)
-
-            self.softmax = nn.Softmax(dim=1)
-            self.idx_tensor = torch.FloatTensor([idx for idx in range(90)]).to(self.device)
+                gpu_id = self.device.index if self.device.index is not None else 0
+                self.detector = RetinaFace(gpu_id=gpu_id)
 
     def step(self, frame: np.ndarray) -> GazeResultContainer:
         face_imgs = []
@@ -107,18 +108,20 @@ class Pipeline:
         if isinstance(frame, np.ndarray):
             img = prep_input_numpy(frame, self.device)
         elif isinstance(frame, torch.Tensor):
-            img = frame
+            img = frame.to(self.device)
         else:
             raise RuntimeError("Invalid dtype for input")
 
-        gaze_pitch, gaze_yaw = self.model(img)
-        pitch_predicted = self.softmax(gaze_pitch)
-        yaw_predicted = self.softmax(gaze_yaw)
+        # model.py returns (yaw_logits, pitch_logits)
+        gaze_yaw_logits, gaze_pitch_logits = self.model(img)
 
-        pitch_predicted = torch.sum(pitch_predicted.data * self.idx_tensor, dim=1) * 4 - 180
-        yaw_predicted = torch.sum(yaw_predicted.data * self.idx_tensor, dim=1) * 4 - 180
+        pitch_predicted = self.softmax(gaze_pitch_logits)
+        yaw_predicted = self.softmax(gaze_yaw_logits)
 
-        pitch_predicted = pitch_predicted.cpu().detach().numpy() * np.pi / 180.0
-        yaw_predicted = yaw_predicted.cpu().detach().numpy() * np.pi / 180.0
+        pitch_predicted = torch.sum(pitch_predicted * self.idx_tensor, dim=1) * 4 - 180
+        yaw_predicted = torch.sum(yaw_predicted * self.idx_tensor, dim=1) * 4 - 180
 
-        return pitch_predicted, yaw_predicted
+        pitch_predicted = pitch_predicted.detach().cpu().numpy() * np.pi / 180.0
+        yaw_predicted = yaw_predicted.detach().cpu().numpy() * np.pi / 180.0
+
+        return pitch_predicted.astype(np.float32), yaw_predicted.astype(np.float32)
